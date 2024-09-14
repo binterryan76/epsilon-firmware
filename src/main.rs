@@ -11,14 +11,16 @@
 use panic_halt as _;
 
 use cortex_m_rt::entry;
+use cortex_m::interrupt::Mutex;
+use core::cell::RefCell;
 use stm32f4xx_hal::dma::DmaFlag;
 use stm32f4xx_hal::{
     dma::{config::DmaConfig, MemoryToPeripheral, Stream0, StreamsTuple, Transfer}, 
-    gpio::{gpioa, gpiob, gpioc, Speed, Alternate, Pin}, 
-    pac::{self, DMA1, TIM2, interrupt}, 
+    gpio::{self, gpioa, gpiob, gpioc, Speed, Alternate, Pin, PushPull, Output}, 
+    pac::{self, DMA1, TIM2, interrupt, Interrupt}, 
     prelude::*, 
     time::Hertz, 
-    timer::{Channel, Event, Timer, Channel1, Channel2},
+    timer::{Channel, Event, Timer, Channel1, Channel2, CounterUs},
     spi::*,
 };
 
@@ -29,32 +31,36 @@ fn main() -> ! {
         pac::Peripherals::take(),
         cortex_m::peripheral::Peripherals::take(),
     ) {
-        // Set up GPIOB
+        // set up clocks
+        let rcc = pac_peripherals.RCC.constrain();
+        let clocks = rcc.cfgr.sysclk(48.MHz()).pclk1(48.MHz()).freeze();
+        
+        // Set up GPIOA
         let gpioa = pac_peripherals.GPIOA.split();
         
-        // Configure PB15 as alternate function for TIM2 (AF1)
-        let step_pin = gpioa
-            .pa2
-            .into_alternate::<1>() // Use AF1 for TIM2 channel
-            .speed(Speed::VeryHigh);
-        
-        // Set up the system clock. We want to run at 84MHz.
-        let rcc = pac_peripherals.RCC.constrain();
-        let clocks = rcc.cfgr.sysclk(48.MHz()).freeze();
-        let frequency = 48.MHz(); // max seems to be 20kHz for 1/16 microstepping (or 25kHz if using motor 28v at 1/16 microstepping) or 4kHz for 1/4 microstepping
-        let channel = Channel1::new(gpioa.pa0);
+        // Configure PA5 pin to blink LED
+        let mut step = gpioa.pa5.into_push_pull_output().speed(Speed::VeryHigh);
+        step.set_high();
 
-        // Set up TIM2
-        let mut timer = Timer::new(pac_peripherals.TIM2, &clocks).pwm_hz(
-            channel,
-            frequency,  // Set desired square wave frequency, 1 kHz here
-        );
+        // Move the pin into our global storage
+        cortex_m::interrupt::free(|cs| *G_STEP.borrow(cs).borrow_mut() = Some(step));
 
-        // Enable PWM output on Channel 1 (corresponding to step_pin)
-        timer.enable(Channel::C1);
-        
-        // Set the duty cycle to 50% (square wave)
-        timer.set_duty(Channel::C1, timer.get_max_duty() / 2);
+        // Set up a timer expiring after 1s
+        let mut timer = pac_peripherals.TIM2.counter(&clocks);
+        let freq  = 1.micros();
+
+        timer.start(freq).unwrap();
+
+        // Generate an interrupt when the timer expires
+        timer.listen(Event::Update);
+
+        // Move the timer into our global storage
+        cortex_m::interrupt::free(|cs| *G_TIM.borrow(cs).borrow_mut() = Some(timer));
+
+        //enable TIM2 interrupt
+        unsafe {
+            cortex_m::peripheral::NVIC::unmask(Interrupt::TIM2);
+        }
         
         loop {
             // Main loop can handle other tasks if needed
@@ -66,22 +72,44 @@ fn main() -> ! {
     
 }
 
-static mut PULSE_COUNTER: u32 = 0;
 
-// Interrupt handler for TIM2
+// A type definition for the GPIO pin to be used for the step pulses
+type StepPin = gpio::PA5<Output<PushPull>>;
+
+// Make STEP pin globally available
+static G_STEP: Mutex<RefCell<Option<StepPin>>> = Mutex::new(RefCell::new(None));
+
+// Make timer interrupt registers globally available
+static G_TIM: Mutex<RefCell<Option<CounterUs<TIM2>>>> = Mutex::new(RefCell::new(None));
+
+
+// Define an interrupt handler, i.e. function to call when interrupt occurs.
+// This specific interrupt will "trip" when the timer TIM2 times out
+// this seems to cap out at a frequency of 25KHz. perhaps the mutex overhead is too much?
 #[interrupt]
 fn TIM2() {
     unsafe {
-        // Increment the pulse counter
-        PULSE_COUNTER += 1;
+        static mut STEP: Option<StepPin> = None;
+        static mut TIM: Option<CounterUs<TIM2>> = None;
 
-        // Check if 3200 pulses have been reached
-        if PULSE_COUNTER >= 3200 {
-            // Disable TIM2
-            pac::Peripherals::steal().TIM2.cr1.modify(|_, w| w.cen().clear_bit());
-        }
+        let step = STEP.get_or_insert_with(|| {
+            cortex_m::interrupt::free(|cs| {
+                // Move LED pin here, leaving a None in its place
+                G_STEP.borrow(cs).replace(None).unwrap()
+            })
+        });
+
+        let tim = TIM.get_or_insert_with(|| {
+            cortex_m::interrupt::free(|cs| {
+                // Move LED pin here, leaving a None in its place
+                G_TIM.borrow(cs).replace(None).unwrap()
+            })
+        });
+
+        step.toggle();
+        let _ = tim.wait();
 
         // Clear the interrupt flag
-        pac::Peripherals::steal().TIM2.sr.modify(|_, w| w.uif().clear_bit());
+        //pac::Peripherals::steal().TIM2.sr.modify(|_, w| w.uif().clear_bit());
     }
 }
